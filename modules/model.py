@@ -1,5 +1,6 @@
 import math
 import torch
+import torch.nn.functional as F
 from itertools import accumulate
 from torch import nn
 
@@ -27,6 +28,87 @@ def load_weights(model, path):
                 model.state_dict()[name].copy_(param)
                 found.append(name)
     return found
+
+
+class LabelSmoothingBCEWithLogitsLoss:
+    def __init__(
+        self,
+        weighted=False,
+        label_smoothing=True,
+        alpha=0.1,
+        period=None,
+        pos_weight=None,
+    ):
+        """
+        weighted: использовать ли веса для объектов при вычислении функции потерь
+        label_smoothing: использовать ли label_smoothing
+        alpha: предельное значение искажения таргета для label smoothing
+        period: период, определяет насколько медленно уменьшается label smoothing
+            для объектов с более высокими uid (чем больше, тем медленнее уменьшение);
+            Закон изменения - экспоненциальный, для uid = 0 таргет изменяется на alpha.
+            Если None, то таргет изменяется на alpha для всех uid.
+        pos_weight: коэффициент, на который будет умножаться лосс объектов положительного класса
+        """
+        self._weighted = weighted
+        self._label_smoothing = label_smoothing
+        self._alpha = alpha
+        self._period = period
+        if self._weighted:
+            self._criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction=None)
+        else:
+            self._criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    def __call__(self, input, target, uid=None):
+        if self._weighted:
+            if uid is not None:
+                weights = self._alpha * torch.exp(-uid / self._period)
+                return torch.sum(self._criterion(input, target) * weights) / torch.sum(weights)
+            else:
+                return torch.mean(self._criterion(input, target))
+        else:
+            if self._label_smoothing:
+                alpha = self._alpha
+                if self._period is not None and uid is not None:
+                    alpha = alpha * torch.exp(-uid / self._period)
+                target = (1 - alpha) * target + alpha / 2
+            return self._criterion(input, target)
+
+
+class FullyConnectedMLP(nn.Module):
+    def __init__(self, input_dim, hiddens, output_dim, dropout_prob=0., act_func='relu'):
+        """
+        input_dim: входная размерность
+        hiddens: список внутренних размерностей
+        output_dim: выходная размерность
+        dropout_prob: вероятность дропаута
+        act_func: функция активации
+        """
+        assert isinstance(hiddens, list)
+        super().__init__()
+        act_func_map = {
+            'relu': nn.ReLU,
+            'tanh': nn.Tanh,
+            'leaky_relu': nn.LeakyReLU,
+        }
+        layers = []
+        dims = [input_dim] + hiddens + [output_dim]
+        for in_features, out_features in zip(dims[:-2], dims[1:]):
+            layers += [
+                nn.Linear(in_features, out_features),
+                act_func_map[act_func](),
+                nn.Dropout(dropout_prob)
+            ]
+        layers += [nn.Linear(dims[-2], dims[-1])]
+        self._net = nn.Sequential(*layers)
+        # self.init_weights()
+
+    def init_weights(self):
+        for layer in self._net:
+            if isinstance(layer, nn.Linear):
+                init_layer(layer)
+
+    def forward(self, x):
+        return self._net(x)
 
 
 class BertEmbeddings(nn.Module):
@@ -81,7 +163,7 @@ class BertEmbeddings(nn.Module):
         """
         B, S, F = input_ids.shape
         pos = torch.arange(S).repeat(B, 1).to(input_ids.device)
-        embs = torch.cat([self._token_embeddings[i](input_ids[:, :, i].squeeze(-1)) for i in range(F)], dim=-1)  # [B x S x D]
+        embs = torch.cat([self._token_embeddings[i](input_ids[:, :, i]) for i in range(F)], dim=-1)  # [B x S x D]
         embs = embs + self._pos_embeddings(pos)
         if token_type_ids is not None:
             embs = embs + self._seg_embeddings(token_type_ids)
@@ -109,7 +191,7 @@ class MultiHeadSelfAttention(nn.Module):
         assert hidden_size % num_attention_heads == 0
         self._hidden_size = hidden_size
         self._num_heads = num_attention_heads
-        self._linear = nn.Linear(hidden_size, 3*hidden_size)
+        self._linear = nn.Linear(hidden_size, 3 * hidden_size)
         self._att_dropout = nn.Dropout(attention_probs_dropout_prob)
         self._out_linear = nn.Linear(hidden_size, hidden_size)
         self._out_dropout = nn.Dropout(dropout_prob)
@@ -383,6 +465,77 @@ class ClassifierHead(nn.Module):
             return logits
 
 
+class PoolingClassifierHead(nn.Module):
+    def __init__(self, input_dim, output_dim, hiddens=None, dropout_prob=0., act_func='relu'):
+        """
+        input_dim: входная размерность
+        hiddens: список внутренних размерностей
+        output_dim: выходная размерность
+        dropout_prob: вероятность дропаута
+        act_func: функция активации
+        """
+        super().__init__()
+        if hiddens is None:
+            hiddens = [2 * input_dim, input_dim]
+        self._fc = FullyConnectedMLP(
+            input_dim=input_dim,
+            output_dim=output_dim,
+            hiddens=hiddens,
+            dropout_prob=dropout_prob,
+            act_func=act_func,
+        )
+
+    def forward(self, hidden_states):
+        """
+        hidden_states: эмбеддинги (batch_size x seqlen x hidden_size)
+        """
+        seq_max_pool = torch.max(hidden_states, dim=1)[0]
+        seq_avg_pool = torch.sum(hidden_states, dim=1) / hidden_states.shape[1]
+        seq_state = torch.cat([seq_max_pool, seq_avg_pool], dim=-1)
+        logits = self._fc(seq_state)
+        return logits
+
+
+class ConvClassifierHead(nn.Module):
+    def __init__(self, embedding_size, n_features=128, window_sizes=(1, 3, 5), fc_dropout_prob=0.):
+        """
+        embedding_size: размерность входных эмбеддингов
+        n_features: количество выходных каналов для сверток
+        window_sizes: размеры окон (высоты сверток)
+        fc_dropout_prob: вероятность дропаута в линейном слое
+        """
+        super().__init__()
+        self._convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(1, n_features, kernel_size=(window_size, embedding_size), padding=(window_size // 2, 0)),
+                nn.BatchNorm2d(n_features),
+                nn.ReLU(),
+            )
+            for window_size in window_sizes
+        ])
+        self._fc = FullyConnectedMLP(
+            input_dim=len(window_sizes) * n_features,
+            hiddens=[n_features],
+            output_dim=1,
+            dropout_prob=fc_dropout_prob,
+            act_func='relu'
+        )
+
+    def forward(self, hidden_states):
+        """
+        hidden_states: эмбеддинги (batch_size x seqlen x hidden_size)
+        """
+        x = hidden_states.unsqueeze(1)  # [N, 1, S, D]
+        xs = []
+        for conv in self._convs:
+            x2 = conv(x)  # [N, C, S, 1]
+            x2 = F.max_pool2d(x2, kernel_size=(x2.shape[-2], 1))  # [N, C, 1, 1]
+            xs.append(x2.view(x2.shape[:2]))
+        x = torch.cat(xs, dim=1)  # [N, C * len(window_sizes)]
+        logits = self._fc(x)
+        return logits
+
+
 class BertModel(nn.Module):
     def __init__(
         self,
@@ -424,13 +577,13 @@ class BertModel(nn.Module):
         )
         self._mlm_heads = nn.ModuleList([
             MlmHead(
-                embedding_size,
-                vocab_size,
-                act_func,
-                eps,
-                ignore_index,
+                hidden_size=embedding_layer_size[1],
+                vocab_size=embedding_layer_size[0],
+                hidden_act=act_func,
+                eps=eps,
+                ignore_index=ignore_index,
                 input_embeddings=self._backbone.get_token_embeddings(i)
-            ) for i, vocab_size, embedding_size in enumerate(embedding_layer_sizes)
+            ) for i, embedding_layer_size in enumerate(embedding_layer_sizes)
         ])
         self._classifier_head = ClassifierHead(
             self._hidden_size,
@@ -443,43 +596,12 @@ class BertModel(nn.Module):
         mlm_losses = []
         for i in range(self._num_embeddings):
             start_idx = self._embedding_start_idxs[i]
-            stop_idx = self._embedding_start_idxs[i+1]
+            stop_idx = self._embedding_start_idxs[i + 1]
             mlm_losses.append(self._mlm_heads[i](hidden_states[:, :, start_idx: stop_idx], labels[:, :, i]))
         mlm_loss = sum(loss * weight for loss, weight in zip(mlm_losses, self._mlm_loss_weights)) / sum(self._mlm_loss_weights)
         sop_loss = self._classifier_head(hidden_states, permuted)
         # в оригинальном BERT лоссы MLP и NSP используются с равными весами
         return 0.5 * mlm_loss + 0.5 * sop_loss, {'MLM': mlm_loss, 'SOP': sop_loss}
-
-
-class FullyConnectedMLP(nn.Module):
-    def __init__(self, input_dim, hiddens, output_dim, dropout_prob=0.):
-        """
-        input_dim: входная размерность
-        hiddens: список внутренних размерностей
-        output_dim: выходная размерность
-        dropout_prob: вероятность дропаута
-        """
-        assert isinstance(hiddens, list)
-        super().__init__()
-        layers = []
-        dims = [input_dim] + hiddens + [output_dim]
-        for in_features, out_features in zip(dims[:-2], dims[1:]):
-            layers += [
-                nn.Linear(in_features, out_features),
-                nn.ReLU(),
-                nn.Dropout(dropout_prob)
-            ]
-        layers += [nn.Linear(dims[-2], dims[-1])]
-        self._net = nn.Sequential(*layers)
-        # self.init_weights()
-
-    def init_weights(self):
-        for layer in self._net:
-            if isinstance(layer, nn.Linear):
-                init_layer(layer)
-
-    def forward(self, x):
-        return self._net(x)
 
 
 class BertFinetuneModel(nn.Module):
@@ -498,6 +620,7 @@ class BertFinetuneModel(nn.Module):
         clf_head_hiddens=None,
         clf_head_dropout_prob=0.,
         padding_idx=None,
+        clf_head_type='pooling',
     ):
         super().__init__()
         embedding_sizes = list(zip(*embedding_layer_sizes))[1]
@@ -515,19 +638,24 @@ class BertFinetuneModel(nn.Module):
             eps=eps,
             padding_idx=padding_idx
         )
-        if clf_head_hiddens is None:
-            clf_head_hiddens = [2*self._hidden_size, self._hidden_size]
-        self._classifier_head = FullyConnectedMLP(
-            input_dim=2*self._hidden_size,
-            hiddens=clf_head_hiddens,
-            output_dim=1,
-            dropout_prob=clf_head_dropout_prob
-        )
+        if clf_head_type == 'classic':
+            self._classifier_head = ClassifierHead(self._hidden_size, 1, clf_head_dropout_prob)
+        elif clf_head_type == 'pooling':
+            self._classifier_head = PoolingClassifierHead(
+                input_dim=2 * self._hidden_size,
+                output_dim=1,
+                hiddens=clf_head_hiddens,
+                dropout_prob=clf_head_dropout_prob,
+                act_func='relu',
+            )
+        else:  # 'conv'
+            self._classifier_head = ConvClassifierHead(
+                embedding_size=self._hidden_size,
+                n_features=128,
+                window_sizes=(1, 3, 5),
+                fc_dropout_prob=clf_head_dropout_prob,
+            )
 
     def forward(self, x, attention_mask):
         hidden_states = self._backbone(x, attention_mask)  # batch_size x seqlen x hidden_size
-        seq_max_pool = torch.max(hidden_states, dim=1)[0]
-        seq_avg_pool = torch.sum(hidden_states, dim=1) / hidden_states.shape[1]
-        seq_state = torch.cat([seq_max_pool, seq_avg_pool], dim=-1)
-        logits = self._classifier_head(seq_state)
-        return logits
+        return self._classifier_head(hidden_states)

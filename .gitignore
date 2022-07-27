@@ -137,3 +137,5 @@ data*.zip
 
 # backups
 backup*
+modules/model copy.py
+modules/data2.py

@@ -2,7 +2,7 @@ import random
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 # from torch.nn.utils.rnn import pad_sequence
 
 
@@ -30,7 +30,7 @@ def load_data(chunk_paths, features, df_target=None, presort=False, ascending=Fa
         if df_target is not None:
             chunk = chunk.merge(right=df_target, left_index=True, right_on="id")
         res.append(chunk)
-    df = pd.concat(res)
+    df = pd.concat(res).reset_index(drop=df_target is not None)
     if presort:
         df = (
             df
@@ -94,7 +94,7 @@ class PretrainDataset(Dataset):
         self._num_special_tokens = len(self._special_tokens_map)
         self._true_vocab_sizes = self._vocab_sizes - self._num_special_tokens
         self._minlen = minlen
-        self._maxlen = maxlen - 2  # + два служебных токена [CLS] и [SEP]
+        self.set_maxlen(maxlen=maxlen)
         self._permute_prob = permute_prob
         self._mask_prob = mask_prob
         self._true_masking_prob = 1.0 - keep_unchanged_prob - random_replace_prob
@@ -104,30 +104,35 @@ class PretrainDataset(Dataset):
         self._non_target_idx = non_target_idx
         df = (
             df
-            .assign(length=lambda _df: _df["sequence"].apply(len))
+            .assign(length=lambda _df: _df["sequence"].apply(len), dtype=np.int8)
             .query(f"length > {self._minlen}")
-            .drop(columns=["length"])
             .reset_index(drop=True)
         )
         if presort:
             df = (
                 df
                 .sort_values(["length"])
-                .drop(columns=["length"])
                 .reset_index(drop=True)
             )
+        self._df_idx_to_length_mapping = df.assign(idx=lambda _df: _df.index)[["idx", "length"]]
         self._data = df.to_dict(orient="index")
         self._n_features = self._data[0]["sequence"].shape[1]
         self._cls_token_ids = np.full(self._n_features, self._special_tokens_map["cls"], dtype=np.int8)
         self._sep_token_ids = np.full(self._n_features, self._special_tokens_map["sep"], dtype=np.int8)
         self._non_target_token_ids = np.full(self._n_features, self._non_target_idx, dtype=np.int8)
 
-    def set_maxlen(self, maxlen):
-        """
-        Устанавливает новое максимальное значение длины выходной последовательности
-        maxlen: максимальная длина выходной последовательности
-        """
-        self._maxlen = maxlen - 2  # + два служебных токена [CLS] и [SEP]
+    def generate_buckets(self):
+        buckets = (
+            self._df_idx_to_length_mapping
+            .assign(bucket=lambda _df: _df["length"].clip(upper=self._seq_max_len))
+            .groupby("bucket")["idx"].apply(list).to_dict()
+        )
+        return buckets
+
+    def set_maxlen(self, maxlen, return_buckets=False):
+        self._seq_max_len = maxlen - 2  # + два служебных токена [CLS] и [SEP]
+        if return_buckets:
+            return self.generate_buckets()
 
     def __len__(self):
         return len(self._data)
@@ -142,9 +147,9 @@ class PretrainDataset(Dataset):
         """
         data = self._data[idx]
         seq_len = data["sequence"].shape[0]
-        if seq_len > self._maxlen:
-            start_idx = random.randint(0, seq_len - self._maxlen)
-            stop_idx = start_idx + self._maxlen
+        if seq_len > self._seq_max_len:
+            start_idx = random.randint(0, seq_len - self._seq_max_len)
+            stop_idx = start_idx + self._seq_max_len
             seq = data["sequence"][start_idx: stop_idx].copy()
         else:
             seq = data["sequence"].copy()
@@ -217,19 +222,115 @@ class PretrainCollator:
 
 
 class CommonDataset(Dataset):
-    def __init__(self, df, maxlen, presort=False, inference=False):
+    def __init__(self, df, maxlen, presort=False):
         """
         df: pd.DataFrame со столбцами <sequence> <id> <flag>
-            (стобей <flag> не требуется, если inference=True)
         maxlen: максимальная длина последовательности
         presort: отсортировать последовательности по длине
-        inference: режим использования датасета:
-            - True для инференса
-            - False для трейна
         """
         super().__init__()
         self._maxlen = maxlen
-        self._inference = inference
+        if presort:
+            df = (
+                df
+                .assign(length=lambda _df: _df["sequence"].apply(len))
+                .sort_values(["length"])
+                .drop(columns=["length"])
+                .reset_index(drop=True)
+            )
+        self._df_idx_to_length_mapping = (
+            df
+            .assign(idx=lambda _df: _df.index)
+            .assign(length=lambda _df: _df["sequence"].apply(len))[["idx", "length"]]
+        )
+        self._data = df.to_dict(orient="index")
+
+    def __len__(self):
+        return len(self._data)
+
+    def generate_buckets(self):
+        buckets = (
+            self._df_idx_to_length_mapping
+            .assign(bucket=lambda _df: _df["length"].clip(upper=self._maxlen))
+            .groupby("bucket")["idx"].apply(list).to_dict()
+        )
+        return buckets
+
+    def set_maxlen(self, maxlen, return_buckets=False):
+        self._maxlen = maxlen
+        if return_buckets:
+            return self.generate_buckets()
+
+    def __getitem__(self, idx):
+        """
+        returns:
+            input_ids - nd.array с индексами токенов последовательности
+            target - целевая переменная (0 или 1)
+            uid - уникальный id объекта
+        """
+        data = self._data[idx]
+        input_ids = data["sequence"][: self._maxlen, :]
+        target = data["flag"]
+        uid = data["id"]
+        return input_ids, target, uid
+
+
+class CommonCollator:
+    def __init__(
+        self,
+        padding_value=0,
+        reverse=False,
+        dropout_prob=0,
+    ):
+        """
+        padding_value: значение паддинга
+        reverse: отражать ли зеркально полседовательности
+        dropout_prob: вероятность зануления элемента последовательности
+        """
+        self._padding_value = padding_value
+        self._reverse = reverse
+        self._dropout_prob = dropout_prob
+
+    def __call__(self, batch):
+        input_ids, targets, uids = zip(*batch)
+        if self._reverse:
+            input_ids = [np.flip(x, axis=0) for x in input_ids]
+        input_ids = pad_sequence(input_ids, padding_value=self._padding_value)
+        if self._dropout_prob > 0 and input_ids.shape[1] > 1:
+            mask = np.random.rand(*input_ids.shape) > self._dropout_prob
+            input_ids = input_ids * mask + self._padding_value * ~mask
+        input_ids = torch.LongTensor(input_ids)
+        targets = torch.FloatTensor(targets)
+        uids = torch.LongTensor(uids)
+        return input_ids, targets, uids
+
+
+class BucketSampler(Sampler):
+    def __init__(self, buckets, shuffle=False):
+        self._buckets = buckets
+        self._shuffle = shuffle
+        self._length = sum(len(idxs) for idxs in self._buckets.values())
+
+    def __iter__(self):
+        if self._shuffle:
+            for bucket in self._buckets:
+                np.random.shuffle(self._buckets[bucket])
+        for bucket in sorted(self._buckets.keys()):
+            yield from self._buckets[bucket]
+
+    def __len__(self):
+        return self._length
+
+
+class InferenceDataset(Dataset):
+    def __init__(self, df, maxlen, presort=False):
+        """
+        df: pd.DataFrame со столбцами <sequence> <id>
+        maxlen: максимальная длина последовательности
+        presort: отсортировать последовательности по длине
+        """
+        super().__init__()
+        self._maxlen = maxlen
         if presort:
             df = (
                 df
@@ -243,43 +344,34 @@ class CommonDataset(Dataset):
     def __len__(self):
         return len(self._data)
 
-    def set_maxlen(self, maxlen):
-        self._maxlen = maxlen
-
     def __getitem__(self, idx):
         """
         returns:
+            uid - уникальный идентификатор объекта
             input_ids - nd.array с индексами токенов последовательности
-            target - целевая переменная (0 или 1)
         """
         data = self._data[idx]
+        uid = data["id"]
         input_ids = data["sequence"][: self._maxlen, :]
-        if self._inference:
-            return input_ids
-        target = data["flag"]
-        return input_ids, target
+        return uid, input_ids
 
 
-class CommonCollator:
-    def __init__(self, padding_value=0, reverse=False, dropout_prob=0, inference=False):
+class InferenceCollator:
+    def __init__(self, padding_value=0, reverse=False, vocab_sizes=None):
         self._padding_value = padding_value
         self._reverse = reverse
-        self._dropout_prob = dropout_prob
-        self._inference = inference
+        if vocab_sizes is not None:
+            self._max_ids = vocab_sizes[None, None, ...] - 1  # 1 x 1 x F
+        else:
+            self._max_ids = None
 
     def __call__(self, batch):
-        if self._inference:
-            input_ids = batch
-        else:
-            input_ids, targets = zip(*batch)
-            targets = torch.FloatTensor(targets)
+        uid, input_ids = zip(*batch)
         if self._reverse:
             input_ids = [np.flip(x, axis=0) for x in input_ids]
         input_ids = pad_sequence(input_ids, padding_value=self._padding_value)
-        if self._dropout_prob > 0:
-            mask = np.random.rand(*input_ids.shape) > self._dropout_prob
-            input_ids = input_ids * mask
+        if self._max_ids is not None:
+            input_ids[input_ids > self._max_ids] = self._padding_value
         input_ids = torch.LongTensor(input_ids)
-        if self._inference:
-            return input_ids
-        return input_ids, targets
+        uid = torch.LongTensor(uid)
+        return uid, input_ids
