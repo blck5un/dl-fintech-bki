@@ -191,6 +191,7 @@ class FinetuneTrainer:
         max_grad_norm=None,
         num_accum_steps=1,
         checkpoint_path="best_checkpoint.pt",
+        weighted_loss=False,
     ):
         """
         model: объект класса BertModel
@@ -203,6 +204,7 @@ class FinetuneTrainer:
         max_grad_norm: максимум нормы градиентов, для клиппинга
         num_accum_steps: количество шагов аккумуляции градиента
         checkpoint_path: путь для сохранения лучшей модели
+        weighted_loss: использовать ли для каждого объекта свой вес при подсчете лосса
         """
         self._model = model
         self._optimizer = optimizer
@@ -216,6 +218,7 @@ class FinetuneTrainer:
         self._checkpoint_path = checkpoint_path
         self._verbose = True
         self._label_smoothing = isinstance(self._criterion, LabelSmoothingBCEWithLogitsLoss)
+        self._weighted_loss = weighted_loss
 
     def _print(self, *args, **kwargs):
         if self._verbose:
@@ -310,7 +313,7 @@ class FinetuneTrainer:
             targets = targets.to(self._device)
             attention_mask = (input_ids[:, :, 0] != self._pad_token_id).float()
             logits = self._model(input_ids, attention_mask)
-            if self._label_smoothing:
+            if self._label_smoothing or self._weighted_loss:
                 uids = uids.to(self._device)
                 loss = self._criterion(logits.squeeze(-1), targets, uids)
             else:

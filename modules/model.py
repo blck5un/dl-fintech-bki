@@ -54,7 +54,7 @@ class LabelSmoothingBCEWithLogitsLoss:
         self._alpha = alpha
         self._period = period
         if self._weighted:
-            self._criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction=None)
+            self._criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction='none')
         else:
             self._criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
