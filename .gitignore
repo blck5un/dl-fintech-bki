@@ -139,3 +139,7 @@ data*.zip
 backup*
 modules/model copy.py
 modules/data2.py
+
+# misc
+results/
+data_analysis.json

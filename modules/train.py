@@ -146,13 +146,14 @@ class PreTrainer:
         epoch: номер эпохи обучения
         """
         self._optimizer.zero_grad()
-        for input_ids, token_type_ids, labels, permuted in tqdm.tqdm(dataloader, desc=f"Epoch: {epoch:02}", mininterval=2):
+        for input_ids, labels, cls_target, token_type_ids in tqdm.tqdm(dataloader, desc=f"Epoch: {epoch:02}", mininterval=2):
             input_ids = input_ids.to(self._device)
-            token_type_ids = token_type_ids.to(self._device)
             labels = labels.to(self._device)
-            permuted = permuted.to(self._device)
+            cls_target = cls_target.to(self._device)
+            if token_type_ids is not None:
+                token_type_ids = token_type_ids.to(self._device)
             attention_mask = (input_ids[:, :, 0] != self._pad_token_id).float()
-            loss, dct_losses = self._model(input_ids, attention_mask, labels, permuted, token_type_ids)
+            loss, dct_losses = self._model(input_ids, attention_mask, labels, cls_target, token_type_ids)
             current_lr = self._scheduler.get_last_lr()
             # logging
             self._writer.add_scalar('Pre-train/total_loss', loss.item(), self._n_iter)
