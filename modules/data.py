@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, Sampler
-# from torch.nn.utils.rnn import pad_sequence
 
 
 def load_data(chunk_paths, features, df_target=None, presort=False, ascending=False, shift_value=0):

@@ -32,12 +32,11 @@ def roc_auc_scorer(target, pred):
     return "roc_auc", roc_auc_score(target, pred)
 
 
-def inference(model, dataloader, device, pad_token_id=0):
+def inference(model, dataloader, device):
     """
     model: модель, с помощью которой будет осуществляться инференс
     dataloader: даталоадер тестового датасета
     device: девайс, на который будут перемещаться данные
-    pad_token_id: индекс токена паддинга
     returns: pd.DataFrame со столбцами <id> <score>
     """
     model.eval()
@@ -46,8 +45,7 @@ def inference(model, dataloader, device, pad_token_id=0):
     with torch.no_grad():
         for uid, input_ids in dataloader:
             input_ids = input_ids.to(device)
-            attention_mask = (input_ids[:, :, 0] != pad_token_id).float()
-            logits = model(input_ids, attention_mask)
+            logits = model(input_ids)
             uid_list.append(uid)
             preds_list.append(logits.squeeze(-1).cpu())
     uids = torch.cat(uid_list).numpy()
@@ -106,7 +104,6 @@ class PreTrainer:
         model,
         optimizer,
         scheduler,
-        pad_token_id,
         device,
         num_accum_steps=1,
         logdir=None,
@@ -116,7 +113,6 @@ class PreTrainer:
         model: объект класса BertModel
         optimizer: оптимизатор
         scheduler: расписание learning rate. Нужно вызывать scheduler.step() ПОСЛЕ optimizer.step()
-        pad_token_id: индекс паддинга. Нужен для создания attention mask
         device: девайс (cpu или cuda), на котором надо производить вычисления
         num_accum_steps: количество шагов аккумуляции градиента
         logdir: директория для записи логов
@@ -126,7 +122,6 @@ class PreTrainer:
         self._optimizer = optimizer
         # self._model, self._optimizer = amp.initialize(model, optimizer, opt_level='O1')
         self._scheduler = scheduler
-        self._pad_token_id = pad_token_id
         self._device = device
         self._num_accum_steps = num_accum_steps
         self._logdir = logdir
@@ -152,8 +147,7 @@ class PreTrainer:
             cls_target = cls_target.to(self._device)
             if token_type_ids is not None:
                 token_type_ids = token_type_ids.to(self._device)
-            attention_mask = (input_ids[:, :, 0] != self._pad_token_id).float()
-            loss, dct_losses = self._model(input_ids, attention_mask, labels, cls_target, token_type_ids)
+            loss, dct_losses = self._model(input_ids, labels, cls_target, token_type_ids)
             current_lr = self._scheduler.get_last_lr()
             # logging
             self._writer.add_scalar('Pre-train/total_loss', loss.item(), self._n_iter)
@@ -186,32 +180,32 @@ class FinetuneTrainer:
         optimizer,
         scheduler,
         criterion,
-        pad_token_id,
         device,
         logdir=None,
         max_grad_norm=None,
         num_accum_steps=1,
         checkpoint_path="best_checkpoint.pt",
         weighted_loss=False,
+        scheduler_step_after_epoch=False,
     ):
         """
         model: объект класса BertModel
         optimizer: оптимизатор
         scheduler: расписание learning rate. Нужно вызывать scheduler.step() ПОСЛЕ optimizer.step()
         criterion: функция потерь
-        pad_token_id: индекс паддинга. Нужен для создания attention mask
         device: девайс (cpu или cuda), на котором надо производить вычисления
         logdir: директория для записи логов
         max_grad_norm: максимум нормы градиентов, для клиппинга
         num_accum_steps: количество шагов аккумуляции градиента
         checkpoint_path: путь для сохранения лучшей модели
         weighted_loss: использовать ли для каждого объекта свой вес при подсчете лосса
+        scheduler_step_after_epoch: выполнять шаг планировщика в конце каждой эпохи
+            (иначе после каждого шага оптимизатора)
         """
         self._model = model
         self._optimizer = optimizer
         self._scheduler = scheduler
         self._criterion = criterion
-        self._pad_token_id = pad_token_id
         self._device = device
         self._logdir = logdir
         self._max_grad_norm = max_grad_norm
@@ -220,12 +214,22 @@ class FinetuneTrainer:
         self._verbose = True
         self._label_smoothing = isinstance(self._criterion, LabelSmoothingBCEWithLogitsLoss)
         self._weighted_loss = weighted_loss
+        self._scheduler_step_after_epoch = scheduler_step_after_epoch
 
     def _print(self, *args, **kwargs):
         if self._verbose:
             print(*args, **kwargs)
 
-    def train(self, dataloaders, n_epochs, scorer, save_checkpoint=True, score_th=0.5, verbose=True, break_after_epoch=None):
+    def train(
+        self,
+        dataloaders,
+        n_epochs,
+        scorer,
+        save_checkpoint=True,
+        score_th=0.5,
+        verbose=True,
+        break_after_epoch=None,
+    ):
         """
         dataloaders: dict of dataloaders, keys 'train', 'valid' should be present.
         n_epochs: int. Num epochs to train for.
@@ -259,6 +263,8 @@ class FinetuneTrainer:
                 f"time: {train_time:.2f}",
                 sep=", "
             )
+            if self._scheduler_step_after_epoch:
+                self._scheduler.step()
             # valid
             t_start = time.time()
             valid_loss, valid_targets, valid_preds = self._evaluate(dataloaders['valid'])
@@ -312,8 +318,8 @@ class FinetuneTrainer:
             targets_list.append(targets.detach().cpu())
             input_ids = input_ids.to(self._device)
             targets = targets.to(self._device)
-            attention_mask = (input_ids[:, :, 0] != self._pad_token_id).float()
-            logits = self._model(input_ids, attention_mask)
+            logits = self._model(input_ids)
+            # get loss
             if self._label_smoothing or self._weighted_loss:
                 uids = uids.to(self._device)
                 loss = self._criterion(logits.squeeze(-1), targets, uids)
@@ -335,7 +341,8 @@ class FinetuneTrainer:
                 if self._max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._max_grad_norm)
                 self._optimizer.step()
-                self._scheduler.step()
+                if not self._scheduler_step_after_epoch:
+                    self._scheduler.step()
                 self._optimizer.zero_grad()
         dl_targets = torch.cat(targets_list).numpy()
         dl_preds = torch.cat(preds_list).numpy()
@@ -355,9 +362,8 @@ class FinetuneTrainer:
                 targets_list.append(targets.detach().cpu())
                 input_ids = input_ids.to(self._device)
                 targets = targets.to(self._device)
-                attention_mask = (input_ids[:, :, 0] != self._pad_token_id).float()
+                logits = self._model(input_ids)
                 # get loss
-                logits = self._model(input_ids, attention_mask)
                 loss = self._criterion(logits.squeeze(-1), targets)
                 preds_list.append(logits.detach().cpu())
                 total_loss += loss.item()

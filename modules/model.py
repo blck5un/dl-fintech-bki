@@ -551,9 +551,10 @@ class BertModel(nn.Module):
         eps=1e-3,
         ignore_index=-100,
         mlm_loss_weights=None,
-        padding_idx=None,
+        pad_token_id=0,
     ):
         super().__init__()
+        self._pad_token_id = pad_token_id
         embedding_sizes = list(zip(*embedding_layer_sizes))[1]
         self._num_embeddings = len(embedding_sizes)
         self._hidden_size = sum(embedding_sizes)
@@ -573,7 +574,7 @@ class BertModel(nn.Module):
             attention_probs_dropout_prob=attention_probs_dropout_prob,
             act_func=act_func,
             eps=eps,
-            padding_idx=padding_idx
+            padding_idx=None,
         )
         self._mlm_heads = nn.ModuleList([
             MlmHead(
@@ -591,7 +592,8 @@ class BertModel(nn.Module):
             num_classes=1
         )
 
-    def forward(self, x, attention_mask, labels, permuted, token_type_ids=None):
+    def forward(self, x, labels, permuted, token_type_ids=None):
+        attention_mask = (x[:, :, 0] != self._pad_token_id).float()
         hidden_states = self._backbone(x, attention_mask, token_type_ids)
         mlm_losses = []
         for i in range(self._num_embeddings):
@@ -619,10 +621,11 @@ class BertFinetuneModel(nn.Module):
         eps=1e-3,
         clf_head_hiddens=None,
         clf_head_dropout_prob=0.,
-        padding_idx=None,
+        pad_token_id=0,
         clf_head_type='pooling',
     ):
         super().__init__()
+        self._pad_token_id = pad_token_id
         embedding_sizes = list(zip(*embedding_layer_sizes))[1]
         self._hidden_size = sum(embedding_sizes)
         self._backbone = Bert(
@@ -636,7 +639,7 @@ class BertFinetuneModel(nn.Module):
             attention_probs_dropout_prob=attention_probs_dropout_prob,
             act_func=act_func,
             eps=eps,
-            padding_idx=padding_idx
+            padding_idx=None
         )
         if clf_head_type == 'classic':
             self._classifier_head = ClassifierHead(self._hidden_size, 1, clf_head_dropout_prob)
@@ -657,5 +660,49 @@ class BertFinetuneModel(nn.Module):
             )
 
     def forward(self, x, attention_mask):
+        attention_mask = (x[:, :, 0] != self._pad_token_id).float()
         hidden_states = self._backbone(x, attention_mask)  # batch_size x seqlen x hidden_size
         return self._classifier_head(hidden_states)
+
+
+class CreditsRNN(nn.Module):
+    def __init__(
+        self,
+        embedding_layer_sizes,
+        hidden_size=128,
+        num_layers=1,
+        rnn_dropout=0.,
+        fc_dropout=0.,
+    ):
+        super().__init__()
+        self._token_embeddings = nn.ModuleList([
+            nn.Embedding(vocab_size, embedding_size, padding_idx=None)
+            for vocab_size, embedding_size in embedding_layer_sizes
+        ])
+        self._embedding_size = sum([embedding_size for vocab_size, embedding_size in embedding_layer_sizes])
+        self._hidden_size = hidden_size
+        self._gru = nn.GRU(
+            input_size=self._embedding_size,
+            hidden_size=self._hidden_size,
+            num_layers=num_layers,
+            dropout=rnn_dropout,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self._fc = FullyConnectedMLP(
+            input_dim=self._hidden_size*4,
+            hiddens=[self._hidden_size*2, self._hidden_size],
+            output_dim=1,
+            dropout_prob=fc_dropout,
+            act_func='relu'
+        )
+
+    def forward(self, input_ids):
+        B, S, F = input_ids.shape
+        embs = torch.cat([self._token_embeddings[i](input_ids[:, :, i]) for i in range(F)], dim=-1)  # [B x S x D]
+        outputs, last_hidden = self._gru(embs)
+        outputs_max_pool = torch.max(outputs, dim=1)[0]
+        outputs_avg_pool = torch.sum(outputs, dim=1) / outputs.shape[1]
+        seq_state = torch.cat([outputs_max_pool, outputs_avg_pool], dim=-1)  # [B x 4*D]
+        logits = self._fc(seq_state)
+        return logits

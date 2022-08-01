@@ -143,3 +143,4 @@ modules/data2.py
 # misc
 results/
 data_analysis.json
+logs.txt
